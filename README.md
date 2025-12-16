@@ -12,14 +12,14 @@
   - **Otsu (binary)**
   - **Adaptive (binary)**
   - **Watershed**
-  - **U-Net** (Keras `.keras/.h5`, SavedModel directory, or **TFLite `.tflite`**)
+  - **U-Net** (Keras `.keras/.h5`or **TFLite `.tflite`**)
 - Post-processing to improve separation of touching nuclei:
   - morphological operations
   - hole filling
   - small object removal
   - watershed splitting on binary masks
-  - *(optional)* opening by reconstruction
-  - *(optional)* skeletonization
+  - opening by reconstruction
+  - skeletonization
 - Quantitative metrics:
   - number of detected nuclei
   - mask coverage percentage
@@ -37,19 +37,28 @@ Clone the repository:
 ```bash
 git clone https://github.com/your-username/NucleiNet.git
 cd NucleiNet
-Install dependencies:
+```
+
+## Install dependencies:
 
 Core dependencies:
+```bash
 pip install -r requirements.txt
+```
 
-Running the application
+## Running the application
 Standard run:
+```bash
 streamlit run app.py
+```
+
 The application will open in your browser at the local URL printed in the terminal.
 
 Running with large images or stacks
 When working with large microscopy images or large multi-frame TIFF stacks, Streamlit’s default upload and message size limits may be insufficient. Use the following command to increase these limits:
+```bash
 streamlit run app.py --server.maxUploadSize=2000 --server.maxMessageSize=2000
+```
 Values are specified in megabytes (MB). Adjust them according to available system memory.
 
 Notes on large files
