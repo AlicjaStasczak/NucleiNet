@@ -1,6 +1,5 @@
 import os
 import json
-import glob
 import cv2
 import numpy as np
 import streamlit as st
@@ -8,14 +7,21 @@ import matplotlib.pyplot as plt
 from io import BytesIO
 from PIL import Image
 from pathlib import Path
-import tempfile, shutil
+import tempfile
+import shutil
 from typing import Optional, Dict, Any
 
 # TensorFlow for Keras/SavedModel and TFLite
 from tensorflow.keras.models import load_model as keras_load_model
 import tensorflow as tf
 
-st.set_page_config(page_title="🔬 NucleoNet", layout="wide")
+st.set_page_config(page_title="🔬 NucleiNet", layout="wide")
+
+# ===============================
+# Repo-relative paths
+# ===============================
+APP_DIR = Path(__file__).resolve().parent
+DEFAULT_MODEL_FOLDER = APP_DIR / "Model_UNET_with_boundary_proximity_loss_maps"
 
 # ============ Optional deps for advanced post-processing ============
 try:
@@ -45,19 +51,17 @@ def normalize_to_u8(arr):
 
 def convert_to_pil(img) -> Image.Image:
     if img is None:
-        raise ValueError("convert_to_pil: obraz jest None")
+        raise ValueError("convert_to_pil: image is None")
     if isinstance(img, Image.Image):
         return img
     arr = normalize_to_u8(img)
     if not isinstance(arr, np.ndarray):
-        raise TypeError("convert_to_pil: nieobsługiwany typ danych")
+        raise TypeError("convert_to_pil: unsupported data type")
     if arr.ndim == 2:
         return Image.fromarray(arr, mode="L")
     if arr.ndim == 3:
-        # Jeśli źródło jest z OpenCV i ma BGR, przekształć je wcześniej do RGB!
-        # Tu zakładamy RGB/RGBA.
         return Image.fromarray(arr)
-    raise ValueError(f"convert_to_pil: nieoczekiwany kształt tablicy: {arr.shape}")
+    raise ValueError(f"convert_to_pil: unexpected array shape: {arr.shape}")
 
 def show_u8(img, *args, **kwargs):
     """Display image safely (uint8), auto-normalizing if needed."""
@@ -206,7 +210,7 @@ def watershed_on_mask(mask_u8, min_peak_frac=0.6):
     _, sure_fg = cv2.threshold(dist, float(min_peak_frac) * dist.max(), 255, 0)
     sure_fg = sure_fg.astype(np.uint8)
     unknown = cv2.subtract(m, sure_fg)
-    num, markers = cv2.connectedComponents(sure_fg)
+    _, markers = cv2.connectedComponents(sure_fg)
     markers = markers + 1
     markers[unknown == 255] = 0
     color = cv2.cvtColor(m, cv2.COLOR_GRAY2BGR)
@@ -316,14 +320,19 @@ def watershed_segment(
     return color, ws_mask
 
 # ===============================
-# U-Net loaders (Keras/SavedModel/TFLite) + metadata
+# Metadata + default model discovery
 # ===============================
 
 @st.cache_resource
 def load_metadata() -> Dict[str, Any]:
-    meta_paths = ["metadata.json", os.path.join("/mnt/data", "metadata.json")]
+    # Prefer metadata.json next to app.py; then cwd; optional /mnt/data
+    meta_paths = [
+        APP_DIR / "metadata.json",
+        Path("metadata.json"),
+        Path("/mnt/data/metadata.json"),
+    ]
     for p in meta_paths:
-        if os.path.exists(p):
+        if p.exists():
             try:
                 with open(p, "r", encoding="utf-8") as f:
                     return json.load(f)
@@ -331,18 +340,37 @@ def load_metadata() -> Dict[str, Any]:
                 pass
     return {}
 
+def discover_model_candidates(folder: Path) -> list[str]:
+    """Search for .tflite/.keras/.h5 and SavedModel dirs inside a folder."""
+    if not folder.exists() or not folder.is_dir():
+        return []
+    candidates: list[str] = []
+    # Prefer tflite first
+    candidates += [str(p) for p in sorted(folder.glob("*.tflite"))]
+    candidates += [str(p) for p in sorted(folder.glob("*.keras"))]
+    candidates += [str(p) for p in sorted(folder.glob("*.h5"))]
+    for d in sorted(folder.iterdir()):
+        if d.is_dir() and (d / "saved_model.pb").exists():
+            candidates.append(str(d))
+    return candidates
+
 META = load_metadata()
 DEFAULT_W = int(META.get("img_width", 256))
 DEFAULT_H = int(META.get("img_height", 256))
 DEFAULT_THRESH = float(META.get("threshold", 0.5))
 INPUT_NORM = META.get("normalization", "gray/255.0")
+
+# IMPORTANT: DEFAULT_MODEL_FOLDER first
 DEFAULT_MODEL_CANDIDATES = [
-    META.get("default_model_path", ""),               # prefer metadata if provided
-    "/mnt/data/model.tflite",
-    "/mnt/data/model.keras",
+    META.get("default_model_path", ""),
+    *discover_model_candidates(DEFAULT_MODEL_FOLDER),
+    str(APP_DIR / "model.tflite"),
+    str(APP_DIR / "model.keras"),
     "model.tflite",
     "model.keras",
-    "./saved_model",  # directory with saved_model.pb
+    "./saved_model",
+    "/mnt/data/model.tflite",
+    "/mnt/data/model.keras",
 ]
 
 class InferenceHandle:
@@ -366,7 +394,6 @@ def load_unet_any(path: str) -> Optional[InferenceHandle]:
             interpreter = tf.lite.Interpreter(model_path=path)
             interpreter.allocate_tensors()
             return InferenceHandle("tflite", interpreter, path)
-        # SavedModel directory
         if os.path.isdir(path) and os.path.exists(os.path.join(path, "saved_model.pb")):
             model = tf.keras.models.load_model(path, compile=False)
             return InferenceHandle("keras", model, path)
@@ -454,22 +481,54 @@ for key, default in [
     if key not in ss:
         ss[key] = default
 
-# ======= Auto-load default model on startup (no interaction) =======
+# ===============================
+# Force default model from DEFAULT_MODEL_FOLDER
+# ===============================
 
-def ensure_default_model_loaded():
-    if ss.get("unet_handle") is not None:
-        return
+def _is_from_default_folder(p: str) -> bool:
+    try:
+        pp = Path(p).resolve()
+        return DEFAULT_MODEL_FOLDER.resolve() in pp.parents
+    except Exception:
+        return False
+
+def ensure_default_model_loaded(force_folder_priority: bool = True):
+    """
+    If force_folder_priority=True:
+      - always prefer models from DEFAULT_MODEL_FOLDER.
+      - if a model is already loaded but NOT from DEFAULT_MODEL_FOLDER, replace it.
+    """
+    folder_candidates = discover_model_candidates(DEFAULT_MODEL_FOLDER)
+
+    # If already loaded:
+    if ss.get("unet_handle") is not None and ss.unet_handle is not None:
+        if (not force_folder_priority) or _is_from_default_folder(ss.unet_handle.path):
+            return
+        # otherwise override with folder model if available
+        if folder_candidates:
+            h = load_unet_any(folder_candidates[0])
+            if h is not None:
+                ss.unet_handle = h
+            return
+
+    # Nothing loaded: try folder first
+    if folder_candidates:
+        h = load_unet_any(folder_candidates[0])
+        if h is not None:
+            ss.unet_handle = h
+            return
+
+    # Fallback to remaining candidates
     for cand in DEFAULT_MODEL_CANDIDATES:
         if not cand:
             continue
-        # SavedModel dir or file
         if os.path.isdir(cand) or os.path.isfile(cand):
             h = load_unet_any(cand)
             if h is not None:
                 ss.unet_handle = h
-                break
+                return
 
-ensure_default_model_loaded()
+ensure_default_model_loaded(force_folder_priority=True)
 
 # ===============================
 # TABS
@@ -478,15 +537,27 @@ ensure_default_model_loaded()
 tab_seg, tab_metrics, tab_help = st.tabs(["🧩 Segmenter", "📊 Metrics", "📖 Instructions"])
 
 with tab_seg:
-    st.title("🔬 NucleoNet")
+    st.title("🔬 NucleiNet")
+
+    # Debug/maintenance: optional reset button
+    with st.sidebar.expander("🧰 Model debugging", expanded=False):
+        st.write(f"DEFAULT_MODEL_FOLDER: `{DEFAULT_MODEL_FOLDER}`")
+        st.write(f"Exists: `{DEFAULT_MODEL_FOLDER.exists()}`")
+        if ss.get("unet_handle") is not None:
+            st.write(f"Loaded: `{ss.unet_handle.path}`")
+        if st.button("Reset loaded model (this session)"):
+            ss.unet_handle = None
+            ensure_default_model_loaded(force_folder_priority=True)
+            st.success("Model reset and reloaded (preferred from DEFAULT_MODEL_FOLDER).")
 
     uploaded_file = st.file_uploader(
         "📂 Upload a microscopy image or stack (e.g., multi-page TIFF, GIF)",
         type=["jpg", "png", "tif", "tiff", "bmp", "gif"]
     )
+
     if uploaded_file:
         ss.tmp_path = save_upload_to_temp(uploaded_file)
-        fmt, n_frames = get_stack_info(ss.tmp_path)
+        _, n_frames = get_stack_info(ss.tmp_path)
         ss.n_frames = n_frames
 
         if n_frames > 1:
@@ -500,9 +571,6 @@ with tab_seg:
         ss.last_original = current_img
         show_u8(current_img, caption=f"📷 Original image (frame {ss.frame_idx+1}/{n_frames})", width=320)
 
-        # ---------------------------
-        # Cropping
-        # ---------------------------
         st.sidebar.header("✂️ Cropping")
         h_img, w_img = current_img.shape[:2]
         crop_top = st.sidebar.slider("Top", 0, max(1, h_img // 2), 10, key="crop_top")
@@ -523,9 +591,6 @@ with tab_seg:
         cropped = apply_crop(current_img)
         ss.last_cropped = cropped
 
-        # ---------------------------
-        # Pre-processing
-        # ---------------------------
         st.sidebar.header("🧪 Image processing")
 
         clahe_on = st.sidebar.checkbox("CLAHE", value=False, key="pp_clahe")
@@ -569,9 +634,6 @@ with tab_seg:
 
         proc = apply_preproc(cropped)
 
-        # ---------------------------
-        # Segmentation controls → cfg
-        # ---------------------------
         st.sidebar.header("🧩 Segmentation")
         segment_option = st.sidebar.selectbox(
             "Segmentation method",
@@ -622,9 +684,10 @@ with tab_seg:
 
         elif segment_option == "U-Net":
             st.sidebar.subheader("📦 Load U-Net model")
-            # Default: prefer auto-loaded handle if exists
             loaded_path = ss.unet_handle.path if ss.get("unet_handle") else ""
-            default_path = loaded_path or ("/mnt/data/model.tflite" if os.path.exists("/mnt/data/model.tflite") else "")
+            folder_cands = discover_model_candidates(DEFAULT_MODEL_FOLDER)
+            folder_default = folder_cands[0] if folder_cands else ""
+            default_path = loaded_path or folder_default or ""
             manual = st.sidebar.text_input("Model path (.keras / .h5 / .tflite / SavedModel dir)", value=default_path)
             cfg["model_path"] = manual
             cfg["unet_thresh"] = st.sidebar.slider("U-Net probability threshold", 0.1, 0.95, float(DEFAULT_THRESH), 0.05, key="unet_thresh")
@@ -637,7 +700,6 @@ with tab_seg:
                 else:
                     st.sidebar.success(f"Loaded model: {ss.unet_handle.kind} — {Path(ss.unet_handle.path).name}")
 
-        # Whole stack toggle
         process_all = False
         if n_frames > 1:
             st.sidebar.markdown("---")
@@ -648,9 +710,6 @@ with tab_seg:
                 key="proc_all_stack"
             )
 
-        # ---------------------------
-        # Pure segmentation
-        # ---------------------------
         def apply_segmentation_no_ui(proc_img, cfg):
             mode = cfg["mode"]
 
@@ -670,7 +729,7 @@ with tab_seg:
                 if cfg.get("show_debug", False):
                     ws_overlay, ws_mask, _ = watershed_segment(
                         proc_img,
-                        blur_type=cfg["blur_type"], blur_ksize=cfg["blur_ksize"], blur_sigma=cfg["ws_blur_sigma"] if "ws_blur_sigma" in cfg else cfg["blur_sigma"],
+                        blur_type=cfg["blur_type"], blur_ksize=cfg["blur_ksize"], blur_sigma=cfg["blur_sigma"],
                         thresh_mode=cfg["thresh_mode"], adaptive_block=cfg["adaptive_block"], adaptive_C=cfg["adaptive_C"],
                         invert_binary=cfg["invert_binary"], morph_kernel=cfg["morph_kernel"],
                         opening_iter=cfg["opening_iter"], dilate_iter=cfg["dilate_iter"],
@@ -701,21 +760,14 @@ with tab_seg:
                 if handle is not None:
                     mask_u = segment_with_unet_handle(handle, proc_img, target_size=(DEFAULT_W, DEFAULT_H), thresh=cfg["unet_thresh"])
                     return mask_u, mask_u
-                else:
-                    st.warning("U-Net model is not loaded — check the sidebar.")
-                    return proc_img, None
+                st.warning("U-Net model is not loaded — check the sidebar.")
+                return proc_img, None
 
             return proc_img, None
 
-        # =========================
-        # Single frame vs entire stack
-        # =========================
         if not process_all:
             processed_to_show, mask_to_use = apply_segmentation_no_ui(proc, cfg)
 
-            # ---------------------------
-            # Post-processing (NEW)
-            # ---------------------------
             st.subheader("🧹 Post-processing (improve separation)")
             if mask_to_use is not None:
                 with st.expander("Post-processing options", expanded=True):
@@ -731,22 +783,16 @@ with tab_seg:
                     pp_skeleton   = st.checkbox("Skeletonize (1px-wide)", value=False, help="Requires scikit-image")
 
                 post_mask = mask_to_use.copy()
-                # Morphology (classical)
                 post_mask = morph_separate(post_mask, op=pp_morph_op, ksize=pp_morph_ks, iters=pp_morph_it)
-                # Fill holes
                 if pp_fill:
                     post_mask = fill_holes_u8(post_mask)
-                # Remove small objects
                 if pp_min_area > 0:
                     _, kept = count_cells_filtered(post_mask, min_area_px=int(pp_min_area), exclude_border=False, do_fill_holes=False)
                     post_mask = kept
-                # Watershed split on mask
                 if pp_ws:
                     post_mask = watershed_on_mask(post_mask, min_peak_frac=pp_ws_thresh)
-                # Opening by reconstruction (shape-preserving)
                 if pp_open_rec:
                     post_mask = opening_by_reconstruction(post_mask, pp_rec_size)
-                # Skeletonization last
                 if pp_skeleton:
                     post_mask = skeletonize_binary(post_mask)
 
@@ -771,17 +817,12 @@ with tab_seg:
 
             ss.last_processed = processed_display
 
-            # Download single frame
             st.subheader("📥 Download result")
             result_image = convert_to_pil(processed_display)
             buf = BytesIO()
             result_image.save(buf, format="PNG")
-            st.download_button("📁 Download PNG",
-                               buf.getvalue(),
-                               file_name=f"result_frame_{ss.frame_idx+1}.png",
-                               mime="image/png")
+            st.download_button("📁 Download PNG", buf.getvalue(), file_name=f"result_frame_{ss.frame_idx+1}.png", mime="image/png")
 
-            # Clear stack caches
             ss.processed_stack = None
             ss.masks_stack = None
             ss.metrics_stack = None
@@ -793,7 +834,6 @@ with tab_seg:
 
             default_min_area = max(20, int(0.0005 * (proc.shape[0] * proc.shape[1])))
 
-            # Post-processing settings for stack
             with st.expander("Post-processing options for stack", expanded=True):
                 pp_morph_op  = st.selectbox("Morphological op", ["none", "erode", "open", "close", "dilate"], index=0, key="stk_morph_op")
                 pp_morph_ks  = st.slider("Kernel size", 1, 31, 3, step=2, key="stk_morph_ks")
@@ -836,6 +876,7 @@ with tab_seg:
                     n_cells, _ = count_cells_filtered(pm, min_area_px=default_min_area, exclude_border=True, do_fill_holes=True)
                 else:
                     occ, total, pct, n_cells = 0, proc_i.size, 0.0, 0
+
                 metrics_list.append({
                     "frame_index": idx,
                     "occupied_pixels": int(occ),
@@ -853,8 +894,7 @@ with tab_seg:
             st.subheader("👀 Preview processed stack")
             if n_frames > 0:
                 ss.result_view_idx = st.slider("Result frame", 0, n_frames - 1, 0, key="result_view_slider")
-                show_u8(processed_list[ss.result_view_idx],
-                        caption=f"Result frame {ss.result_view_idx+1}/{n_frames}", width=512)
+                show_u8(processed_list[ss.result_view_idx], caption=f"Result frame {ss.result_view_idx+1}/{n_frames}", width=512)
 
             st.markdown("---")
             st.subheader("📦 Download stack results")
@@ -869,21 +909,11 @@ with tab_seg:
                 return buf_tif.getvalue()
 
             tiff_bytes = encode_stack_to_tiff(processed_list)
-            st.download_button(
-                "📁 Download processed stack (TIFF)",
-                data=tiff_bytes,
-                file_name="processed_stack.tiff",
-                mime="image/tiff"
-            )
+            st.download_button("📁 Download processed stack (TIFF)", data=tiff_bytes, file_name="processed_stack.tiff", mime="image/tiff")
 
             import pandas as pd
             dfm = pd.DataFrame(metrics_list)
-            st.download_button(
-                "📊 Download per-frame metrics (CSV)",
-                data=dfm.to_csv(index=False).encode("utf-8"),
-                file_name="stack_metrics.csv",
-                mime="text/csv"
-            )
+            st.download_button("📊 Download per-frame metrics (CSV)", data=dfm.to_csv(index=False).encode("utf-8"), file_name="stack_metrics.csv", mime="text/csv")
 
             st.info("Tip: Metrics tab uses the last single-frame run. For stack-wide metrics, use the CSV above.")
 
@@ -892,7 +922,6 @@ with tab_metrics:
 
     if ss.last_mask is not None:
         mask_u8 = normalize_to_u8(ss.last_mask)
-
         occ, total, pct = occupancy_from_mask(mask_u8)
 
         st.subheader("Cell counting controls")
@@ -901,12 +930,7 @@ with tab_metrics:
         exclude_border = st.checkbox("Exclude cells touching image border", value=True, key="met_excl_border")
         do_fill_holes  = st.checkbox("Fill holes inside cells", value=True, key="met_fill_holes")
 
-        n_cells, kept_mask = count_cells_filtered(
-            mask_u8,
-            min_area_px=min_area_px,
-            exclude_border=exclude_border,
-            do_fill_holes=do_fill_holes
-        )
+        n_cells, kept_mask = count_cells_filtered(mask_u8, min_area_px=min_area_px, exclude_border=exclude_border, do_fill_holes=do_fill_holes)
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Occupied pixels (mask)", f"{occ:,}")
@@ -916,8 +940,7 @@ with tab_metrics:
 
         st.caption(
             "Coverage is computed exclusively from the 0/255 binary mask. "
-            "Cell count uses connected components after optional hole filling, area filtering, "
-            "and border exclusion."
+            "Cell count uses connected components after optional hole filling, area filtering, and border exclusion."
         )
 
         st.image(kept_mask, caption="Mask used for counting (filtered)", width=320, clamp=True)
@@ -936,28 +959,22 @@ with tab_metrics:
             "fill_holes": [bool(do_fill_holes)],
         }
         df_report = pd.DataFrame(report_data)
-        st.download_button(
-            label="📥 Download metrics (CSV)",
-            data=df_report.to_csv(index=False).encode("utf-8"),
-            file_name="segmentation_metrics.csv",
-            mime="text/csv"
-        )
+        st.download_button(label="📥 Download metrics (CSV)", data=df_report.to_csv(index=False).encode("utf-8"), file_name="segmentation_metrics.csv", mime="text/csv")
     else:
         st.info("Run a segmentation first to generate a binary mask and compute metrics.")
 
 with tab_help:
     st.title("📖 Instructions")
 
-    # Live model info (if loaded)
     model_info_lines = []
     if ss.get("unet_handle") is not None:
         model_info_lines.append(f"**Loaded model:** `{Path(ss.unet_handle.path).name}`")
+        model_info_lines.append(f"**Full path:** `{ss.unet_handle.path}`")
         model_info_lines.append(f"**Format:** `{ss.unet_handle.kind}`")
     else:
-        if os.path.exists("/mnt/data/model.tflite"):
-            model_info_lines.append("**Default model (preferred):** `/mnt/data/model.tflite`")
-        if os.path.exists("/mnt/data/model.keras"):
-            model_info_lines.append("Also available: `/mnt/data/model.keras`")
+        model_info_lines.append(f"**Default model folder:** `{DEFAULT_MODEL_FOLDER}`")
+        model_info_lines.append("No model loaded.")
+
     model_info_lines.append(f"**Input size:** {DEFAULT_W}×{DEFAULT_H}")
     model_info_lines.append(f"**Default threshold:** {DEFAULT_THRESH}")
     model_info_lines.append(f"**Normalization:** {INPUT_NORM}")
