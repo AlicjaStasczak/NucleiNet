@@ -54,21 +54,21 @@ streamlit run app.py
 
 The application will open in your browser at the local URL printed in the terminal.
 
-Running with large images or stacks
+## Running with large images or stacks
 When working with large microscopy images or large multi-frame TIFF stacks, Streamlit’s default upload and message size limits may be insufficient. Use the following command to increase these limits:
 ```bash
 streamlit run app.py --server.maxUploadSize=2000 --server.maxMessageSize=2000
 ```
 Values are specified in megabytes (MB). Adjust them according to available system memory.
 
-Notes on large files
+## Notes on large files
 Uploaded images and stacks are written to a temporary file on disk.
 
 Multi-frame TIFF stacks are processed frame by frame to reduce memory usage.
 
 Ensure sufficient free disk space in your system temporary directory.
 
-U-Net model support
+## U-Net model support
 The application supports the following model formats:
 
 TFLite (.tflite)
@@ -77,17 +77,17 @@ Keras (.keras or .h5)
 
 Models can be manually selected in the sidebar.
 
-Metrics
+## Metrics
 Coverage is computed exclusively from the binary segmentation mask (values 0/255).
 
 Cell counting is performed using connected components with optional hole filling, area filtering, and border exclusion.
 
 In stack mode, metrics are exported per frame as a CSV file.
 
-Limitations and recommendations
+## Limitations and recommendations
 Segmentation quality depends strongly on image quality and preprocessing choices.
 
 For very large images, consider downsampling or tiling before segmentation.
 
-License
+## License
 This project is released under the MIT License.
