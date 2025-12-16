@@ -89,5 +89,6 @@ Segmentation quality depends strongly on image quality and preprocessing choices
 
 For very large images, consider downsampling or tiling before segmentation.
 
-## License
-This project is released under the MIT License.
+## This work was supported by: 
+
+The “Innovative system for testing chemical compounds (especially drugs) on human and animal cells based on microfluidics” project is carried out within the Proof of Concept (PoC FENG) programme of the Foundation for Polish Science co-financed by the European Union under the European Funds for Smart Economy 2021-2027 (FENG).  
